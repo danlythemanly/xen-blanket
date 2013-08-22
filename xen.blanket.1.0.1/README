@@ -1,0 +1,133 @@
+
+These instructions are for running the Xen Blanket on an Amazon EC2
+cluster instance.  The key components are a patched Xen and blanket
+drivers implemented as Linux modules.  It is fastest to install the
+drivers against a ready-built Linux kernel, although these
+instructions also describe building a Linux kernel from scratch.
+
+1. Launch Amazon Instance.  The instance must be HVM; Amazon's cluster
+   instances work fine.  For example, we used:
+
+   AMI ID: ami-7ea24a17
+   Name: EC2 CentOS 5.4 HVM AMI
+
+2. Log into the Amazon instance.  Download and unpack the Xen-Blanket
+   patches (xen.blanket.1.0.0.tar.gz), then enter the release
+   directory.  
+
+   tar -xvzf xen.blanket.1.0.0.tar.gz
+   cd xen.blanket.1.0.0
+
+3. We must next obtain the third party Xen and Linux sources that we
+   will apply the Xen-Blanket patches against.  They are from the
+   CentOS distribution; the original source RPM
+   (kernel-2.6.18-194.26.1.el5.src.rpm) can be found in the CentOS
+   vault at http://vault.centos.org/5.5/updates/SRPMS/.  For
+   convenience, we have already assembled the source RPM into a
+   tarball, available at http://xcloud.cs.cornell.edu.  From the
+   release directory, download the source tarball, then run the
+   create_source_tree script.  The create_source_tree script patches
+   the supplied kernel and Xen, and also copies and patches PV-on-HVM
+   drivers and virtio drivers to make them work as blanket drivers.
+
+   wget http://xcloud.cs.cornell.edu/code/kernel-2.6.18.tar.gz
+   ./create_source_tree.bash
+
+4. We have now patched the Linux and Xen source to include support for
+   blanket drivers.  Next, we must install the Xen tools, build and
+   install the blanket-enabled Xen, and build and install blanket
+   driver modules.  The modules can be built against a ready-built
+   Linux kernel or we can build a kernel from scratch.  Yum can be
+   used to avoid building most things from scratch.  To be sure that
+   packages obtained from yum are compatible with the patched code
+   version, we first change the yum repositories to point to an older
+   repository by copying the included .repo file.  The following yum
+   line installs the Xen tools, a xen-enabled Linux kernel for domain
+   0, and Xen.  In the next step, we will be replacing the installed
+   Xen with one that supports blanket drivers.
+
+   cp CentOS-Base-Blanket.repo /etc/yum.repos.d/CentOS-Base.repo
+   yum clean all
+   yum install -y xen xen-devel xen-libs xen-libs-devel \
+       	       	  kernel-xen kernel-xen-devel gcc
+   
+5. We must still build and install the blanket-enabled Xen and the
+   blanket driver modules for Linux.  Optionally, we can build a Linux
+   kernel from scratch.  First we enter the patched source directory.
+   
+   cd kernel-2.6.18
+
+   By default, the Makefile is set up to build a Linux kernel from
+   scratch.  To avoid this, edit the Makefile to build the blanket
+   drivers against the second-layer domain 0 Linux kernel installed in
+   the previous step.  For example, to find out the name of the kernel
+   sources, and the kernel version for modules run:
+
+   # ls /usr/src/kernels/|grep el5xen
+   2.6.18-194.32.1.el5xen-x86_64
+
+   # ls /lib/modules/ |grep xen
+   2.6.18-194.32.1.el5xen
+
+   and then change the KERNEL_SRC and KERNEL_VERSION lines in the
+   Makefile to match:
+
+   KERNEL_SRC=/usr/src/kernels/2.6.18-194.32.1.el5xen-x86_64/
+   KERNEL_VERSION=2.6.18-194.32.1.el5xen
+
+6. We will need to make sure the PV drivers will be loaded for the
+   network and the disk on boot by putting aliases in the
+   /etc/modprobe.conf file.  The network alias should already be
+   there.
+
+   #alias scsi_hostadapter ata_piix
+   alias scsi_hostadapter xen-vbd
+   alias eth0 xen-vnif
+
+7. Run make to build and install Linux (optional), Xen, and the
+   blanket drivers for Xen (Amazon is Xen based):
+
+   make linux_install (optional)
+   make xen_install
+   make blanket_drivers_xen_install
+
+8. Fix up the /boot/grub/menu.lst entry.  Set the default to the Xen
+   entry, and replace the xen line with the newly installed Xen.  The
+   grub menu.lst should contain the following.  The console arguments
+   and ide0=noprobe are important; it is recommended that you only
+   change the vmlinuz and initrd names to match the ones on your
+   system.
+
+   serial --unit --speed=57600
+   terminal --timeout=1 console serial
+   default=0
+   timeout=1
+
+   title CentOS (2.6.18-238.9.1.el5xen)
+      root (hd0,0)
+      kernel /xen-3.1.2-blanket.gz com1=115200,8n1 console=com1
+      module /vmlinuz-2.6.18-194.32.1.el5xen ro root=/dev/VolGroup00/LogVol00 rhgb quiet console=hvc0 earlyprintk=xen ide0=noprobe
+      module /initrd-2.6.18-194.32.1.el5xen.img
+
+9. It's probably a good idea to change the default network setup
+   behavior of Xen away from bridging, for example, in
+   /etc/xen/xend-config.sxp.  NAT is one option:
+
+   #(network-script network-bridge)
+   #(vif-script     vif-bridge)
+   (network-script network-nat)
+   (vif-script     vif-nat)
+
+10. Reboot!  When the instance comes back up, you should be able to
+    log into the second-layer domain 0.  Be patient!  If you can
+    connect, the blanket drivers are working.  It's probably a good
+    time to bundle a new instance for yourself now.  If you've waited
+    a while and can't connect, you can see what happened by looking at
+    the System Log from the EC2 web console.  If you don't see
+    anything, make sure you used the correct console arguments in
+    /boot/grub/menu.lst.  If the blanket drivers didn't work but
+    everything else did, you'll see a root@localhost prompt.  In any
+    case, if it didn't work, you will have to try again with a new
+    instance.  Caution: it seems like the System Log is updated fairly
+    infrequently.
+

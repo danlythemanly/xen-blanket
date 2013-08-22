@@ -1,0 +1,919 @@
+diff -Nur xen-4.1.1/xen/arch/x86/apic.c xen-4.1.1-xenblanket/xen/arch/x86/apic.c
+--- xen-4.1.1/xen/arch/x86/apic.c	2011-06-14 12:03:45.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/arch/x86/apic.c	2012-04-09 06:47:23.923422002 -0400
+@@ -547,6 +547,9 @@
+     unsigned long oldvalue, value, ver, maxlvt;
+     int i, j;
+ 
++    int cpu;
++    cpu = smp_processor_id();
++
+     /* Pound the ESR really hard over the head with a big hammer - mbligh */
+     if (esr_disable) {
+         apic_write(APIC_ESR, 0);
+@@ -577,7 +580,12 @@
+     /*
+      * Set Task Priority to reject any interrupts below FIRST_DYNAMIC_VECTOR.
+      */
+-    apic_write_around(APIC_TASKPRI, (FIRST_DYNAMIC_VECTOR & 0xF0) - 0x10);
++    //Use Xen3.0.3's way, also Linux3.x's way, 
++    //that is, instead of following line...
++    //apic_write_around(APIC_TASKPRI, (FIRST_DYNAMIC_VECTOR & 0xF0) - 0x10);
++    value = apic_read(APIC_TASKPRI);
++    value &= ~APIC_TPRI_MASK;
++    apic_write_around(APIC_TASKPRI, value);
+ 
+     /*
+      * After a crash, we no longer service the interrupts and a pending
+@@ -642,12 +650,12 @@
+     /*
+      * Enable directed EOI
+      */
+-    if ( directed_eoi_enabled )
++    /*if ( directed_eoi_enabled )
+     {
+         value |= APIC_SPIV_DIRECTED_EOI;
+         apic_printk(APIC_VERBOSE, "Suppress EOI broadcast on CPU#%d\n",
+                     smp_processor_id());
+-    }
++    }*/
+ 
+     apic_write_around(APIC_SPIV, value);
+ 
+@@ -1156,11 +1164,11 @@
+     apic_write_around(APIC_TMICT, clocks/APIC_DIVISOR);
+ }
+ 
+-static void __devinit setup_APIC_timer(void)
++static void __devinit setup_APIC_timer(unsigned int clocks)
+ {
+     unsigned long flags;
+     local_irq_save(flags);
+-    __setup_APIC_LVTT(0);
++    __setup_APIC_LVTT(clocks);
+     local_irq_restore(flags);
+ }
+ 
+@@ -1253,6 +1261,8 @@
+     return result;
+ }
+ 
++static unsigned int calibration_result;
++
+ void __init setup_boot_APIC_clock(void)
+ {
+     unsigned long flags;
+@@ -1261,28 +1271,27 @@
+ 
+     local_irq_save(flags);
+ 
+-    calibrate_APIC_clock();
++    calibration_result = calibrate_APIC_clock();
+ 
+     if ( tdt_enable && boot_cpu_has(X86_FEATURE_TSC_DEADLINE) )
+     {
+         printk(KERN_DEBUG "TSC deadline timer enabled\n");
+         tdt_enabled = 1;
+     }
+-
+-    setup_APIC_timer();
++    setup_APIC_timer(calibration_result);
+     
+     local_irq_restore(flags);
+ }
+ 
+ void __devinit setup_secondary_APIC_clock(void)
+ {
+-    setup_APIC_timer();
++    setup_APIC_timer(calibration_result);
+ }
+ 
+ void disable_APIC_timer(void)
+ {
+     if (using_apic_timer) {
+-        unsigned long v;
++	unsigned long v;
+ 
+         /* Work around AMD Erratum 411. This is a nice thing to do anyway. */
+         apic_write_around(APIC_TMICT, 0);
+@@ -1295,7 +1304,7 @@
+ void enable_APIC_timer(void)
+ {
+     if (using_apic_timer) {
+-        unsigned long v;
++	unsigned long v;
+         
+         v = apic_read(APIC_LVTT);
+         apic_write_around(APIC_LVTT, v & ~APIC_LVT_MASKED);
+@@ -1335,6 +1344,7 @@
+ fastcall void smp_apic_timer_interrupt(struct cpu_user_regs * regs)
+ {
+     struct cpu_user_regs *old_regs = set_irq_regs(regs);
++
+     ack_APIC_irq();
+     perfc_incr(apic_timer);
+     raise_softirq(TIMER_SOFTIRQ);
+diff -Nur xen-4.1.1/xen/arch/x86/setup.c xen-4.1.1-xenblanket/xen/arch/x86/setup.c
+--- xen-4.1.1/xen/arch/x86/setup.c	2011-06-14 12:03:45.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/arch/x86/setup.c	2012-04-09 07:30:55.787422003 -0400
+@@ -318,6 +318,8 @@
+         unsigned int doffs = dst & mask;
+         unsigned int sz;
+         void *d, *s;
++        unsigned int i;
++        //unsigned int t;
+ 
+         mod.mod_start = (src - soffs) >> PAGE_SHIFT;
+         mod.mod_end = soffs + size;
+@@ -333,8 +335,10 @@
+         if ( sz > mod.mod_end - doffs )
+             sz = mod.mod_end - doffs;
+         d = bootstrap_map(&mod);
+-
+-        memmove(d + doffs, s + soffs, sz);
++        
++        for(i = 0; i < sz; i++) {
++            ((char *)(d + doffs))[i] = ((char *)(s + soffs))[i];
++        }
+ 
+         dst += sz;
+         src += sz;
+@@ -769,11 +773,12 @@
+     modules_headroom = bzimage_headroom(bootstrap_map(mod), mod->mod_end);
+     bootstrap_map(NULL);
+ 
++
+     for ( i = boot_e820.nr_map-1; i >= 0; i-- )
+     {
+         uint64_t s, e, mask = (1UL << L2_PAGETABLE_SHIFT) - 1;
+         uint64_t end, limit = ARRAY_SIZE(l2_identmap) << L2_PAGETABLE_SHIFT;
+-
++        
+         /* Superpage-aligned chunks from BOOTSTRAP_MAP_BASE. */
+         s = (boot_e820.map[i].addr + mask) & ~mask;
+         e = (boot_e820.map[i].addr + boot_e820.map[i].size) & ~mask;
+@@ -829,7 +834,7 @@
+ 
+             /* Poison low 1MB to detect stray pointers to physical 0-1MB. */
+             memset(dst, 0x55, 1U << 20);
+-
++            
+             /* Walk initial pagetables, relocating page directory entries. */
+             pl4e = __va(__pa(idle_pg_table));
+             for ( i = 0 ; i < L4_PAGETABLE_ENTRIES; i++, pl4e++ )
+@@ -888,6 +893,7 @@
+ 
+             bootstrap_map(NULL);
+         }
++             
+ #endif
+ 
+         /* Is the region suitable for relocating the multiboot modules? */
+@@ -1308,6 +1314,7 @@
+     if ( xen_cpuidle )
+         xen_processor_pmbits |= XEN_PROCESSOR_PM_CX;
+ 
++
+     /*
+      * We're going to setup domain0 using the module(s) that we stashed safely
+      * above our heap. The second module, if present, is an initrd ramdisk.
+diff -Nur xen-4.1.1/xen/arch/x86/time.c xen-4.1.1-xenblanket/xen/arch/x86/time.c
+--- xen-4.1.1/xen/arch/x86/time.c	2011-06-14 12:03:45.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/arch/x86/time.c	2012-03-08 01:25:43.000000000 -0500
+@@ -199,6 +199,20 @@
+ 
+ static void timer_interrupt(int irq, void *dev_id, struct cpu_user_regs *regs)
+ {
++    /*
++     * Xenblanket: use broadcasting PIT roughly as a clocksource
++     * Should This be used, comment the following original broadcasting code
++     * After setting APIC TSC Deadline Mode(tdt) to zero, we enable apic
++     * Thus we can live without this patch
++     *
++     */
++    /* int cpu;
++
++    raise_softirq(TIMER_SOFTIRQ);
++    for_each_online_cpu(cpu) {
++        cpu_raise_softirq(cpu, TIMER_SOFTIRQ);
++    } */
++
+     ASSERT(local_irq_is_enabled());
+ 
+     if ( hpet_legacy_irq_tick() )
+diff -Nur xen-4.1.1/xen/arch/x86/x86_64/compat/entry.S xen-4.1.1-xenblanket/xen/arch/x86/x86_64/compat/entry.S
+--- xen-4.1.1/xen/arch/x86/x86_64/compat/entry.S	2011-06-14 12:03:45.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/arch/x86/x86_64/compat/entry.S	2012-03-02 22:10:25.000000000 -0500
+@@ -410,6 +410,14 @@
+         .quad do_domctl
+         .quad compat_kexec_op
+         .quad do_tmem_op
++        .quad do_blanket_get_cpuid
++        .quad do_blanket_init_nested_hypercall /* 40 */
++        .quad do_blanket_xen_version
++        .quad compat_blanket_memory_op
++        .quad do_blanket_hvm_op
++        .quad compat_blanket_grant_table_op
++        .quad do_blanket_event_channel_op /* 45 */
++        .quad do_blanket_sched_op
+         .rept __HYPERVISOR_arch_0-((.-compat_hypercall_table)/8)
+         .quad compat_ni_hypercall
+         .endr
+@@ -458,6 +466,14 @@
+         .byte 1 /* do_domctl                */
+         .byte 2 /* compat_kexec_op          */
+         .byte 1 /* do_tmem_op               */
++        .byte 2 /* do_blanket_get_cpuid     */
++        .byte 0 /* do_blanket_init_nested_hypercall     */  /* 40 */
++        .byte 2 /* do_blanket_xen_version               */
++        .byte 2 /* compat_blanket_memory_op             */
++        .byte 2 /* do_blanket_hvm_op                    */
++        .byte 3 /* compat_blanket_grant_table_op	*/
++        .byte 2 /* do_blanket_event_channel_op          */  /* 45 */
++        .byte 2 /* do_blanket_sched_op   */
+         .rept __HYPERVISOR_arch_0-(.-compat_hypercall_args_table)
+         .byte 0 /* compat_ni_hypercall      */
+         .endr
+diff -Nur xen-4.1.1/xen/arch/x86/x86_64/entry.S xen-4.1.1-xenblanket/xen/arch/x86/x86_64/entry.S
+--- xen-4.1.1/xen/arch/x86/x86_64/entry.S	2011-06-14 12:03:45.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/arch/x86/x86_64/entry.S	2012-03-02 22:10:25.000000000 -0500
+@@ -12,6 +12,8 @@
+ #include <asm/page.h>
+ #include <public/xen.h>
+ 
++/*#define BLANKET_PERF*/
++
+         ALIGN
+ /* %rbx: struct vcpu */
+ switch_to_kernel:
+@@ -39,7 +41,11 @@
+         RESTORE_ALL
+         testw $TRAP_syscall,4(%rsp)
+         jz    iret_exit_to_guest
+-
++#ifdef  BLANKET_PERF
++	SAVE_ALL
++	call  blanket_perf_syscall_end
++	RESTORE_ALL
++#endif
+         addq  $8,%rsp
+         popq  %rcx                    # RIP
+         popq  %r11                    # CS
+@@ -120,6 +126,11 @@
+         movq  24(%rsp),%r11 /* Re-load user RFLAGS into %r11 before SAVE_ALL */
+         SAVE_ALL
+         GET_CURRENT(%rbx)
++#ifdef  BLANKET_PERF
++	SAVE_ALL	
++	call  blanket_perf_syscall_begin
++	RESTORE_ALL
++#endif
+         movq  VCPU_domain(%rbx),%rcx
+         testb $1,DOMAIN_is_32bit_pv(%rcx)
+         jnz   compat_syscall
+@@ -334,6 +345,11 @@
+ /* %rdx: trap_bounce, %rbx: struct vcpu                                  */
+ /* On return only %rbx and %rdx are guaranteed non-clobbered.            */
+ create_bounce_frame:
++#ifdef  BLANKET_PERF
++        SAVE_ALL
++        call  blanket_perf_syscall_bounce_begin
++        RESTORE_ALL
++#endif
+         ASSERT_INTERRUPTS_ENABLED
+         testb $TF_kernel_mode,VCPU_thread_flags(%rbx)
+         jnz   1f
+@@ -415,6 +431,11 @@
+         testq %rax,%rax
+         jz    domain_crash_synchronous
+         movq  %rax,UREGS_rip+8(%rsp)
++#ifdef  BLANKET_PERF
++        SAVE_ALL
++        call  blanket_perf_syscall_bounce_end
++        RESTORE_ALL
++#endif
+         ret
+         _ASM_EXTABLE(.Lft2,  domain_crash_synchronous)
+         _ASM_EXTABLE(.Lft3,  domain_crash_synchronous)
+@@ -697,6 +718,14 @@
+         .quad do_domctl
+         .quad do_kexec_op
+         .quad do_tmem_op
++        .quad do_blanket_get_cpuid
++        .quad do_blanket_init_nested_hypercall /* 40 */
++        .quad do_blanket_xen_version
++	.quad do_blanket_memory_op
++        .quad do_blanket_hvm_op
++        .quad do_blanket_grant_table_op
++        .quad do_blanket_event_channel_op /* 45 */
++        .quad do_blanket_sched_op
+         .rept __HYPERVISOR_arch_0-((.-hypercall_table)/8)
+         .quad do_ni_hypercall
+         .endr
+@@ -745,6 +774,14 @@
+         .byte 1 /* do_domctl            */
+         .byte 2 /* do_kexec             */
+         .byte 1 /* do_tmem_op           */
++        .byte 2 /* do_blanket_get_cpuid */
++        .byte 0 /* do_blanket_init_nested_hypercall	*/  /* 40 */
++        .byte 2 /* do_blanket_xen_version 		*/
++        .byte 2 /* do_blanket_memory_op  		*/
++        .byte 2 /* do_blanket_hvm_op     		*/ 
++        .byte 3 /* do_blanket_grant_table_op		*/
++        .byte 2 /* do_blanket_event_channel_op		*/  /* 45 */
++        .byte 2 /* do_blanket_sched_op   */
+         .rept __HYPERVISOR_arch_0-(.-hypercall_args_table)
+         .byte 0 /* do_ni_hypercall      */
+         .endr
+diff -Nur xen-4.1.1/xen/common/Makefile xen-4.1.1-xenblanket/xen/common/Makefile
+--- xen-4.1.1/xen/common/Makefile	2011-06-14 12:03:45.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/common/Makefile	2012-03-02 22:10:31.000000000 -0500
+@@ -42,6 +42,7 @@
+ obj-y += radix-tree.o
+ obj-y += rbtree.o
+ obj-y += lzo.o
++obj-y += xenblanket.o
+ 
+ obj-$(CONFIG_X86) += decompress.o bunzip2.o unlzma.o unlzo.o
+ 
+diff -Nur xen-4.1.1/xen/common/sched_sedf.c xen-4.1.1-xenblanket/xen/common/sched_sedf.c
+--- xen-4.1.1/xen/common/sched_sedf.c	2011-06-14 12:03:45.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/common/sched_sedf.c	2012-03-04 23:30:08.000000000 -0500
+@@ -330,6 +330,18 @@
+     list_insert_sort(RUNQ(v->processor), LIST(v), runq_comp);
+ }
+ 
++static void sedf_insert_vcpu(const struct scheduler *ops, struct vcpu *v)
++{
++    if( !is_idle_vcpu(v) )
++    {
++        extraq_check(v);
++    }
++    else
++    {
++        EDOM_INFO(v)->deadl_abs = 0;
++        EDOM_INFO(v)->status &= ~SEDF_ASLEEP;
++    }
++}
+ 
+ static void *sedf_alloc_vdata(const struct scheduler *ops, struct vcpu *v, void *dd)
+ {
+@@ -366,7 +378,7 @@
+     INIT_LIST_HEAD(&(inf->extralist[EXTRA_PEN_Q]));
+     INIT_LIST_HEAD(&(inf->extralist[EXTRA_UTIL_Q]));
+  
+-    if ( !is_idle_vcpu(v) )
++    /*if ( !is_idle_vcpu(v) )
+     {
+         extraq_check(v);
+     }
+@@ -374,7 +386,7 @@
+     {
+         inf->deadl_abs = 0;
+         inf->status &= ~SEDF_ASLEEP;
+-    }
++    }*/
+ 
+     return inf;
+ }
+@@ -1498,6 +1510,8 @@
+     .init_domain    = sedf_init_domain,
+     .destroy_domain = sedf_destroy_domain,
+ 
++    .insert_vcpu    = sedf_insert_vcpu,
++
+     .alloc_vdata    = sedf_alloc_vdata,
+     .free_vdata     = sedf_free_vdata,
+     .alloc_pdata    = sedf_alloc_pdata,
+diff -Nur xen-4.1.1/xen/common/xenblanket.c xen-4.1.1-xenblanket/xen/common/xenblanket.c
+--- xen-4.1.1/xen/common/xenblanket.c	1969-12-31 19:00:00.000000000 -0500
++++ xen-4.1.1-xenblanket/xen/common/xenblanket.c	2012-04-09 06:51:14.233422002 -0400
+@@ -0,0 +1,403 @@
++#include <asm/processor.h>
++#include <public/blanket.h>
++#include <xen/config.h>
++#include <xen/init.h>
++#include <xen/lib.h>
++#include <xen/errno.h>
++#include <xen/version.h>
++#include <xen/sched.h>
++#include <xen/paging.h>
++#include <xen/nmi.h>
++#include <xen/guest_access.h>
++#include <asm/current.h>
++#include <public/sched.h>
++#include <public/memory.h>
++#include <public/nmi.h>
++#include <public/version.h>
++#include <xen/hypercall.h>
++#ifdef CONFIG_X86
++#include <asm/shared.h>
++#endif
++#include <compat/memory.h>
++
++
++static char *hypercall_stubs_raw;
++static char *hypercall_stubs;
++
++#include <xen/blanket_hypercall.h>
++
++long do_blanket_get_cpuid(uint32_t base, XEN_GUEST_HANDLE(void) arg)
++{
++   blanket_get_cpuid_t cpuid;
++   cpuid(base, &(cpuid.eax), &(cpuid.ebx), &(cpuid.ecx), &(cpuid.edx));
++   if(copy_to_guest(arg, &cpuid, 1))
++       return -EFAULT;
++   return 0; 
++}
++
++static inline uint32_t xen_cpuid_base(void)
++{
++    uint32_t base, eax, ebx, ecx, edx;
++    char signature[13];
++    for (base = 0x40000000; base < 0x40010000; base += 0x100) {
++        cpuid(base, &eax, &ebx, &ecx, &edx);
++        *(uint32_t *)(signature + 0) = ebx;
++        *(uint32_t *)(signature + 4) = ecx;
++        *(uint32_t *)(signature + 8) = edx;
++        signature[12] = 0;
++
++        if (!strcmp("XenVMMXenVMM", signature) && ((eax - base) >= 2))
++            return base;
++    }
++
++    return 0;    
++}
++
++long do_blanket_init_nested_hypercall(void)
++{
++    uint32_t eax, ebx, ecx, edx, pages, msr, base, i;
++    unsigned long mfn;
++    int major, minor;
++
++    base = xen_cpuid_base();
++    cpuid(base + 1, &eax, &ebx, &ecx, &edx);
++
++    major = eax >> 16;
++    minor = eax & 0xffff;
++    printk(KERN_INFO "XENBLANKET: Xen version %d.%d.\n", major, minor);
++ 
++    cpuid(base + 2, &pages, &msr, &ecx, &edx);
++
++    hypercall_stubs_raw = xmalloc_bytes((pages * PAGE_SIZE) + PAGE_SIZE);
++    hypercall_stubs = (char *)(((unsigned long)hypercall_stubs_raw & ~0xfff) + PAGE_SIZE);
++    printk("XENBLANKET: hypercall_stubs = %p\n", hypercall_stubs);
++
++    for (i = 0; i < pages; i++) {
++        mfn = virt_to_mfn((char *)hypercall_stubs + i*PAGE_SIZE);
++        wrmsrl(msr, ((u64)mfn << PAGE_SHIFT) + i);
++    }
++
++    return 0;
++}
++
++long compat_blanket_grant_table_op(unsigned int cmd,
++                          XEN_GUEST_HANDLE(void) cmp_uop,
++                          unsigned int count)
++{
++    return do_blanket_grant_table_op(cmd, cmp_uop, count);
++}
++
++long compat_blanket_memory_op(int op, XEN_GUEST_HANDLE(void) arg)
++{
++    switch ( op ){
++    case XENMEM_add_to_physmap:{
++        struct compat_add_to_physmap cmp;
++        struct xen_add_to_physmap *nat = (void *)COMPAT_ARG_XLAT_VIRT_BASE;
++        struct xen_add_to_physmap xatp_n;
++        struct domain *d;
++        long ret;
++
++        if ( copy_from_guest(&cmp, arg, 1) ){
++            return -EFAULT;
++        }
++    
++        XLAT_add_to_physmap(nat, &cmp);
++        if ( nat->domid != DOMID_SELF ){
++            return -EPERM;
++        }
++
++        if (( nat->space != XENMAPSPACE_shared_info) && 
++            ( nat->space != XENMAPSPACE_grant_table)){
++            return -EFAULT;
++        }
++
++        d = rcu_lock_current_domain();
++        /* LOCKING: shared_info doesn't need to lock */
++        spin_lock(&d->grant_table->lock);
++
++        xatp_n.domid = DOMID_SELF;
++        xatp_n.idx = nat->idx;
++        xatp_n.space = nat->space;
++        xatp_n.gpfn = nat->gpfn;  /* gpfn is the mfn */
++
++
++        ret = HYPERVISOR_nested_memory_op(XENMEM_add_to_physmap, &xatp_n);
++        if ( ret ){
++            spin_unlock(&d->grant_table->lock);
++            printk("memory op failed with %ld\n", ret);
++            rcu_unlock_domain(d);
++            return -EINVAL;
++        }
++
++        spin_unlock(&d->grant_table->lock);
++        rcu_unlock_domain(d);
++
++        return ret;
++    }
++    default:
++        printk("XENBLANKET: %s %d nested compat memory op not supported!\n", __FILE__, __LINE__);       
++        return -EINVAL;
++    }
++}
++
++
++
++/* simple passthrough */
++long do_blanket_memory_op(int cmd, XEN_GUEST_HANDLE(void) arg)
++{
++    /* map hvm grant table(for ring buf) and shared info page(for evtchn) */
++    switch ( cmd )
++    {
++    /* can map straight through */
++    case XENMEM_add_to_physmap:{
++        int ret = 0;
++        struct xen_add_to_physmap xatp;
++        struct xen_add_to_physmap xatp_n;
++        struct domain *d;
++
++        if ( copy_from_guest(&xatp, arg, 1) )
++            return -EFAULT;
++
++        if ( xatp.domid == DOMID_SELF )
++            d = rcu_lock_current_domain();
++        else if ( !IS_PRIV(current->domain) ) 
++        {
++            printk("XENBLANKET: not privileged domain. %s %d\n", __FILE__, __LINE__);
++            return -EPERM;
++        }
++        else if ( (d = rcu_lock_domain_by_id(xatp.domid)) == NULL )
++        {
++            printk("XENBLANKET: unable to locate domain. %s %d\n", __FILE__, __LINE__);
++            return -ESRCH;
++        }
++
++        switch ( xatp.space )
++        {
++        /* LOCKING: shared_info doesn't need to lock */
++        case XENMAPSPACE_shared_info:
++        case XENMAPSPACE_grant_table:
++            xatp_n.domid = DOMID_SELF;
++            xatp_n.idx = xatp.idx;
++            xatp_n.space = xatp.space;
++            xatp_n.gpfn = xatp.gpfn;  /* gpfn is the mfn */
++            
++            spin_lock(&d->grant_table->lock);
++
++            ret = HYPERVISOR_nested_memory_op(XENMEM_add_to_physmap, &xatp_n);
++            if ( ret )
++            {
++                spin_unlock(&d->grant_table->lock);
++                printk("XENBLANKET: memory op failed with %d\n", ret);
++                rcu_unlock_domain(d);
++                return -EINVAL;
++            }
++            spin_unlock(&d->grant_table->lock);
++            break;
++        default:
++            printk("XENBLANKET: unknown xatp.space (not shared_info or grant_table)\n");
++            rcu_unlock_domain(d);
++            return -EINVAL;
++            break;
++        }
++        rcu_unlock_domain(d);
++        return 0;
++    }
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        return -EINVAL;
++    }
++}
++
++/* simple passthrough */
++long do_blanket_xen_version(int cmd, XEN_GUEST_HANDLE(void) arg)
++{
++    printk("XENBLANKET: in do_blanket_xen_version.\n");
++    switch ( cmd ){
++    case XENVER_version:
++        return HYPERVISOR_nested_xen_version(XENVER_version, 0);
++    case XENVER_get_features:
++    {
++        xen_feature_info_t fi;
++
++        if ( copy_from_guest(&fi, arg, 1) )
++            return -EFAULT;
++        
++        if ( HYPERVISOR_nested_xen_version(XENVER_get_features, &fi) )
++            return -EFAULT;
++
++        if ( copy_to_guest(arg, &fi, 1) )
++            return -EFAULT;
++
++        return 0;
++    }
++    default:
++        printk("XENBLANKET: %s %d do_blanket_xen_version - unknown cmd.\n", __FILE__, __LINE__);
++        return -EINVAL;
++    }
++}
++
++/* simple passthrough */
++long do_blanket_hvm_op(int op, XEN_GUEST_HANDLE(void) arg)
++{
++    /* get xenstore mfn and xenstore evtchn num */
++    switch (op) 
++    {
++    case HVMOP_set_param:
++    case HVMOP_get_param:
++    {
++        struct xen_hvm_param a;
++
++        if (copy_from_guest(&a, arg, 1))
++            return -EFAULT;
++
++        HYPERVISOR_nested_hvm_op(op, &a);
++
++        if (op == HVMOP_get_param) 
++        {
++            if (copy_to_guest(arg, &a, 1))
++                return -EFAULT;
++        }
++        
++        return 0;
++    }
++    default:
++        printk("XENBLANKET: %s %d, can only perform get_hvm_param!\n", __FILE__, __LINE__);
++        return -EINVAL;
++    }
++}
++
++/* simple passthrough */
++long do_blanket_grant_table_op(unsigned int cmd, 
++                          XEN_GUEST_HANDLE(void) uop, 
++                          unsigned int count){
++    long rc = -EINVAL;
++    struct domain *d = current->domain;
++    struct gnttab_query_size op;
++
++
++    if ( count > 512 )
++        return -EINVAL;
++    
++    switch ( cmd ) {
++    case GNTTABOP_query_size:
++        spin_lock(&d->grant_table->lock);
++        if ( count != 1 ){
++            rc = -EINVAL;
++            spin_unlock(&d->grant_table->lock);
++            goto out;
++        }
++
++        if (copy_from_guest(&op, uop, 1)){
++            rc = -EFAULT;
++            spin_unlock(&d->grant_table->lock);
++            goto out;
++        }
++
++        rc = HYPERVISOR_nested_grant_table_op(cmd, &op, count);
++
++        if (copy_to_guest(uop, &op, 1)){
++            rc = -EFAULT;
++            spin_unlock(&d->grant_table->lock);
++            goto out;
++        }
++
++        spin_unlock(&d->grant_table->lock);
++        break;
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        break;
++    }
++
++  out:
++    return rc;
++}
++
++/* simple passthrough */
++long do_blanket_event_channel_op(int cmd, 
++                            XEN_GUEST_HANDLE(void) arg)
++{
++    long rc;
++
++    switch ( cmd ) {
++    case EVTCHNOP_unmask: 
++    {
++        struct evtchn_unmask unmask;
++        if ( copy_from_guest(&unmask, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &unmask);
++        break;
++    }
++    case EVTCHNOP_close: 
++    {
++        struct evtchn_close close;
++        if ( copy_from_guest(&close, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &close);
++        break;
++    }
++    case EVTCHNOP_send: 
++    {
++        struct evtchn_send send;
++        if ( copy_from_guest(&send, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &send);
++        break;
++    }
++    case EVTCHNOP_alloc_unbound: 
++    {
++        struct evtchn_alloc_unbound alloc_unbound;
++        if ( copy_from_guest(&alloc_unbound, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &alloc_unbound);
++        if ( (rc == 0) && (copy_to_guest(arg, &alloc_unbound, 1) != 0) )
++            rc = -EFAULT; /* Cleaning up here would be a mess! */
++        break;
++    }
++    case EVTCHNOP_bind_vcpu: {
++	struct evtchn_bind_vcpu bind_vcpu;
++	if( copy_from_guest(&bind_vcpu, arg, 1) != 0 )
++	    return -EFAULT;
++	rc = HYPERVISOR_nested_event_channel_op(cmd, &bind_vcpu);
++	if( (rc == 0) && (copy_to_guest(arg, &bind_vcpu, 1) != 0) )
++	    rc = -EFAULT;
++	break;
++    }
++    default:
++        printk("%s %d: event nested hypercall %d not implemented!\n", 
++	    __FILE__, __LINE__, cmd);
++        rc = -ENOSYS;
++        break;
++    }
++
++    return rc;
++}
++
++/* simple passthrough */
++long do_blanket_sched_op(int cmd, 
++                    XEN_GUEST_HANDLE(void) arg)
++{
++    long ret = 0;
++
++    switch ( cmd )
++    {
++    case SCHEDOP_shutdown:
++    {
++        struct sched_shutdown sched_shutdown;
++
++        ret = -EFAULT;
++        if ( copy_from_guest(&sched_shutdown, arg, 1) )
++            break;
++
++        ret = HYPERVISOR_nested_sched_op(cmd, &sched_shutdown);        
++
++        break;
++    }
++
++    default:
++        printk("XENBLANKET: %s %d sched op not supported!\n", __FILE__, __LINE__);
++        ret = -ENOSYS;
++        break;
++    }
++
++    return ret;
++}
+diff -Nur xen-4.1.1/xen/include/public/blanket.h xen-4.1.1-xenblanket/xen/include/public/blanket.h
+--- xen-4.1.1/xen/include/public/blanket.h	1969-12-31 19:00:00.000000000 -0500
++++ xen-4.1.1-xenblanket/xen/include/public/blanket.h	2012-03-02 22:10:25.000000000 -0500
+@@ -0,0 +1,14 @@
++#include "xen.h"
++
++#ifndef XEN_BLANKET_HYPERCALL_PARAMS
++#define XEN_BLANKET_HYPERCALL_PARAMS
++
++struct blanket_get_cpuid {
++    uint32_t eax;
++    uint32_t ebx;
++    uint32_t ecx;
++    uint32_t edx;
++};
++typedef struct blanket_get_cpuid blanket_get_cpuid_t;
++
++#endif
+diff -Nur xen-4.1.1/xen/include/xen/blanket_hypercall.h xen-4.1.1-xenblanket/xen/include/xen/blanket_hypercall.h
+--- xen-4.1.1/xen/include/xen/blanket_hypercall.h	1969-12-31 19:00:00.000000000 -0500
++++ xen-4.1.1-xenblanket/xen/include/xen/blanket_hypercall.h	2012-03-02 22:10:25.000000000 -0500
+@@ -0,0 +1,80 @@
++#ifndef __BLANKET_NESTED_HYPERCALL_H__
++#define __BLANKET_NESTED_HYPERCALL_H__
++
++/* Make sure this doesn't go over 47 */
++#define __HYPERVISOR_blanket_get_cpuid 			39
++#define __HYPERVISOR_blanket_init_nested_hypercall     	40	/* 40 */
++#define __HYPERVISOR_blanket_xen_version                41
++#define __HYPERVISOR_blanket_memory_op                  42
++#define __HYPERVISOR_blanket_hvm_op                     43
++#define __HYPERVISOR_blanket_grant_table_op             44
++#define __HYPERVISOR_blanket_event_channel_op          	45	/* 45 */
++#define __HYPERVISOR_blanket_sched_op			46
++
++#define HYPERCALL_STR_nested(name)                         \
++    "movabs hypercall_stubs,%%rax; "                       \
++    "add $("STR(__HYPERVISOR_##name)" * 32),%%rax; "       \
++    "call *%%rax"
++
++#define _hypercall2_nested(type, name, a1, a2)                       \
++    ({                                                               \
++        long __res, __ign1, __ign2;                                  \
++        asm volatile (                                               \
++                      HYPERCALL_STR_nested(name)                     \
++                      : "=a" (__res), "=D" (__ign1), "=S" (__ign2)   \
++                      : "1" ((long)(a1)), "2" ((long)(a2))           \
++                      : "memory" );                                  \
++        (type)__res;                                                 \
++    })
++
++#define _hypercall3_nested(type, name, a1, a2, a3)                      \
++    ({                                                                  \
++        long __res, __ign1, __ign2, __ign3;                             \
++        asm volatile (                                                  \
++                      HYPERCALL_STR_nested(name)                        \
++                      : "=a" (__res), "=D" (__ign1), "=S" (__ign2),     \
++                        "=d" (__ign3)                                   \
++                      : "1" ((long)(a1)), "2" ((long)(a2)),             \
++                        "3" ((long)(a3))                                \
++                      : "memory" );                                     \
++        (type)__res;                                                    \
++    })
++
++
++static inline int 
++HYPERVISOR_nested_xen_version(int cmd, void *arg){
++    return _hypercall2_nested(int, xen_version, cmd, arg);
++}
++static inline int 
++HYPERVISOR_nested_memory_op(int cmd, void *arg){
++    return _hypercall2_nested(int, memory_op, cmd, arg);
++}
++static inline unsigned long
++HYPERVISOR_nested_hvm_op(int op, void *arg){
++    return _hypercall2_nested(unsigned long, hvm_op, op, arg);
++}
++static inline int
++HYPERVISOR_nested_grant_table_op(unsigned int cmd, void *uop, unsigned int count){
++    return _hypercall3_nested(int, grant_table_op, cmd, uop, count);
++}
++static inline int
++HYPERVISOR_nested_event_channel_op(unsigned int cmd, void *arg){
++    return _hypercall2_nested(int, event_channel_op, cmd, arg);
++}
++static inline int
++HYPERVISOR_nested_sched_op(unsigned int cmd, void *arg){
++    return _hypercall2_nested(int, sched_op, cmd, arg);
++}
++
++
++#endif
++
++/*
++ * Local variables:
++ * mode: C
++ * c-set-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -Nur xen-4.1.1/xen/include/xen/hypercall.h xen-4.1.1-xenblanket/xen/include/xen/hypercall.h
+--- xen-4.1.1/xen/include/xen/hypercall.h	2011-06-14 12:03:46.000000000 -0400
++++ xen-4.1.1-xenblanket/xen/include/xen/hypercall.h	2012-03-02 22:10:25.000000000 -0500
+@@ -162,4 +162,19 @@
+ 
+ #endif
+ 
++extern long do_blanket_get_cpuid(uint32_t base, XEN_GUEST_HANDLE(void) arg);
++extern long do_blanket_init_nested_hypercall(void);
++extern long do_blanket_compat_grant_table_op(unsigned int cmd,
++                          XEN_GUEST_HANDLE(void) cmp_uop,
++                          unsigned int count);
++extern long do_blanket_memory_op(int cmd, XEN_GUEST_HANDLE(void) arg);
++extern long do_blanket_xen_version(int cmd, XEN_GUEST_HANDLE(void) arg);
++extern long do_blanket_hvm_op(int op, XEN_GUEST_HANDLE(void) arg);
++extern long do_blanket_grant_table_op(unsigned int cmd,
++                          XEN_GUEST_HANDLE(void) uop,
++                          unsigned int count);
++extern long do_blanket_event_channel_op(int cmd,
++                          XEN_GUEST_HANDLE(void) arg);
++long do_blanket_sched_op(int cmd,
++                    XEN_GUEST_HANDLE(void) arg);
+ #endif /* __XEN_HYPERCALL_H__ */

@@ -1,0 +1,619 @@
+diff -Naur old/kernel-2.6.18/xen/arch/x86/x86_64/compat/entry.S new/kernel-2.6.18/xen/arch/x86/x86_64/compat/entry.S
+--- old/kernel-2.6.18/xen/arch/x86/x86_64/compat/entry.S	2011-05-17 12:58:04.000000000 -0400
++++ new/kernel-2.6.18/xen/arch/x86/x86_64/compat/entry.S	2011-05-17 13:21:36.000000000 -0400
+@@ -342,6 +342,13 @@
+         .quad do_sysctl                 /* 35 */
+         .quad do_domctl
+         .quad compat_kexec_op
++        .quad do_nested_init_hvm
++		.quad do_nested_xen_version
++        .quad compat_nested_memory_op   /* 40 */
++        .quad do_nested_hvm_op
++        .quad compat_nested_grant_table_op
++        .quad do_nested_event_channel_op
++        .quad do_nested_sched_op
+         .rept NR_hypercalls-((.-compat_hypercall_table)/8)
+         .quad compat_ni_hypercall
+         .endr
+@@ -385,6 +392,13 @@
+         .byte 1 /* do_sysctl                */  /* 35 */
+         .byte 1 /* do_domctl                */
+         .byte 2 /* compat_kexec_op          */
++        .byte 0 /* do_nested_init_hvm       */
++        .byte 2 /* do_nested_xen_version    */
++        .byte 2 /* compat_nested_memory_op  */  /* 40 */
++        .byte 2 /* do_nested_hvm_op         */
++        .byte 3 /* compat_nested_grant_table_op */
++        .byte 2 /* do_nested_event_channel_op  */
++        .byte 2 /* do_nested_sched_op       */
+         .rept NR_hypercalls-(.-compat_hypercall_args_table)
+         .byte 0 /* compat_ni_hypercall      */
+         .endr
+diff -Naur old/kernel-2.6.18/xen/arch/x86/x86_64/entry.S new/kernel-2.6.18/xen/arch/x86/x86_64/entry.S
+--- old/kernel-2.6.18/xen/arch/x86/x86_64/entry.S	2011-05-17 12:58:04.000000000 -0400
++++ new/kernel-2.6.18/xen/arch/x86/x86_64/entry.S	2011-05-17 13:21:36.000000000 -0400
+@@ -613,6 +613,13 @@
+         .quad do_sysctl             /* 35 */
+         .quad do_domctl
+         .quad do_kexec_op
++        .quad do_nested_init_hvm
++        .quad do_nested_xen_version
++        .quad do_nested_memory_op   /* 40 */
++        .quad do_nested_hvm_op
++        .quad do_nested_grant_table_op
++        .quad do_nested_event_channel_op
++        .quad do_nested_sched_op
+         .rept NR_hypercalls-((.-hypercall_table)/8)
+         .quad do_ni_hypercall
+         .endr
+@@ -656,6 +663,13 @@
+         .byte 1 /* do_sysctl            */  /* 35 */
+         .byte 1 /* do_domctl            */
+         .byte 2 /* do_kexec             */
++        .byte 0 /* do_nested_init_hvm   */
++        .byte 2 /* do_nested_xen_version */
++        .byte 2 /* do_nested_memory_op  */  /* 40 */
++        .byte 2 /* do_nested_hvm_op     */
++        .byte 3 /* do_nested_grant_table_op     */
++        .byte 2 /* do_nested_event_channel_op   */
++        .byte 2 /* do_nested_sched_op   */
+         .rept NR_hypercalls-(.-hypercall_args_table)
+         .byte 0 /* do_ni_hypercall      */
+         .endr
+diff -Naur old/kernel-2.6.18/xen/common/Makefile new/kernel-2.6.18/xen/common/Makefile
+--- old/kernel-2.6.18/xen/common/Makefile	2011-05-17 12:58:05.000000000 -0400
++++ new/kernel-2.6.18/xen/common/Makefile	2011-05-17 13:21:36.000000000 -0400
+@@ -27,6 +27,7 @@
+ obj-y += vsprintf.o
+ obj-y += xmalloc.o
+ obj-y += rcupdate.o
++obj-y += nested_hypercall.o
+ 
+ obj-$(perfc)       += perfc.o
+ obj-$(crash_debug) += gdbstub.o
+diff -Naur old/kernel-2.6.18/xen/common/nested_hypercall.c new/kernel-2.6.18/xen/common/nested_hypercall.c
+--- old/kernel-2.6.18/xen/common/nested_hypercall.c	1969-12-31 19:00:00.000000000 -0500
++++ new/kernel-2.6.18/xen/common/nested_hypercall.c	2011-05-17 13:21:36.000000000 -0400
+@@ -0,0 +1,395 @@
++
++/* 
++ * Headers copied from kernel.c.  Probably don't need all of them
++ */
++
++#include <xen/config.h>
++#include <xen/init.h>
++#include <xen/lib.h>
++#include <xen/errno.h>
++#include <xen/version.h>
++#include <xen/sched.h>
++#include <xen/paging.h>
++#include <xen/nmi.h>
++#include <xen/guest_access.h>
++#include <asm/current.h>
++#include <public/sched.h>
++#include <public/memory.h>
++#include <public/nmi.h>
++#include <public/version.h>
++#ifdef CONFIG_X86
++#include <asm/shared.h>
++#endif
++#include <compat/memory.h>
++
++#include <xen/nested_hypercall.h>
++
++static char *hypercall_stubs_raw;
++static char *hypercall_stubs; /* PAGE aligned */
++
++/* set up the hypercall page with lower layer */
++static int get_hypercall_stubs(void)
++{
++	uint32_t eax, ebx, ecx, edx, pages, msr, i;
++	char signature[13];
++
++	cpuid(0x40000000, &eax, &ebx, &ecx, &edx);
++	*(uint32_t*)(signature + 0) = ebx;
++	*(uint32_t*)(signature + 4) = ecx;
++	*(uint32_t*)(signature + 8) = edx;
++	signature[12] = 0;
++
++	if (strcmp("XenVMMXenVMM", signature) || (eax < 0x40000002)) {
++		printk("Detected Xen platform device but not Xen VMM?"
++		       " (sig %s, eax %x)\n",
++		       signature, eax);
++		return -EINVAL;
++	}
++
++	cpuid(0x40000001, &eax, &ebx, &ecx, &edx);
++	printk("Xen version %d.%d.\n", eax >> 16, eax & 0xffff);
++
++	cpuid(0x40000002, &pages, &msr, &ecx, &edx);
++	printk("Hypercall area is %u pages.\n", pages);
++
++	hypercall_stubs_raw = xmalloc_bytes((pages * PAGE_SIZE) + PAGE_SIZE);
++    hypercall_stubs = (char *)(((unsigned long)hypercall_stubs_raw & ~0xfff) + PAGE_SIZE);
++	printk("hypercall_stubs_raw = %p\n", hypercall_stubs_raw);
++	printk("hypercall_stubs = %p\n", hypercall_stubs);
++
++	for (i = 0; i < pages; i++) {
++		unsigned long mfn;
++		mfn = virt_to_mfn((char *)hypercall_stubs + i*PAGE_SIZE);
++		wrmsrl(msr, ((u64)mfn << PAGE_SHIFT) + i);
++	}
++
++	return 0;
++}
++
++# define DO(fn) long do_##fn
++
++
++long compat_nested_memory_op(int op, XEN_GUEST_HANDLE(void) arg){
++    switch ( op ){
++    case XENMEM_add_to_physmap:{
++        struct compat_add_to_physmap cmp;
++        struct xen_add_to_physmap *nat = (void *)COMPAT_ARG_XLAT_VIRT_START(current->vcpu_id);
++        struct xen_add_to_physmap xatp_n;
++        struct domain *d;
++        long ret;
++
++        if ( copy_from_guest(&cmp, arg, 1) ){
++            printk("%s:%d:DJWILL: about to return err\n", __FILE__, __LINE__);
++            return -EFAULT;
++        }
++    
++        XLAT_add_to_physmap(nat, &cmp);
++        if ( nat->domid != DOMID_SELF ){
++            printk("%s:%d:DJWILL: about to return err\n", __FILE__, __LINE__);
++            return -EPERM;
++        }
++
++        if (( nat->space != XENMAPSPACE_shared_info) && 
++            ( nat->space != XENMAPSPACE_grant_table)){
++            printk("%s:%d:DJWILL: about to return err\n", __FILE__, __LINE__);
++            return -EFAULT;
++        }
++
++        d = rcu_lock_current_domain();
++        LOCK_BIGLOCK(d);
++
++        //printk("%s:%d:DJWILL: gpfn=0x%x(cmp) 0x%lx(nat) 0x%lx(mfn)\n", __FILE__, __LINE__, cmp.gpfn, nat->gpfn, gmfn_to_mfn(d, nat->gpfn));
++        xatp_n.domid = DOMID_SELF;
++        xatp_n.idx = nat->idx;
++        xatp_n.space = nat->space;
++        xatp_n.gpfn = nat->gpfn;  /* gpfn is the mfn */
++
++
++        ret = HYPERVISOR_nested_memory_op(XENMEM_add_to_physmap, &xatp_n);
++        if ( ret ){
++            printk("memory op failed with %ld\n", ret);
++            UNLOCK_BIGLOCK(d);
++            rcu_unlock_domain(d);
++            return -EINVAL;
++        }
++
++        if (0){
++            int i;
++            printk("HVM shared page:\n");
++            printk("%04d: ", 0);
++            for(i=0;i<4096;i++){
++                printk("%02x ", ((unsigned char *)mfn_to_virt(nat->gpfn))[i]);
++                if ((i+1) % 32 == 0)
++                    printk("\n%04d: ", i+1);
++            }
++            printk("\n");
++            printk("evtchn_pending at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->evtchn_pending[0])) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("evtchn_mask at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->evtchn_mask[0])) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("wc_version at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->wc_version)) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("wc_sec at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->wc_sec)) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("wc_nsec at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->wc_nsec)) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("arch at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->arch)) - (uint64_t)mfn_to_virt(nat->gpfn));
++            printk("evtchn_mask at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->evtchn_mask[0])) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("evtchn_pending at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->evtchn_pending[0])) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("evtchn_pending_sel at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->vcpu_info[0].evtchn_pending_sel)) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("evtchn_upcall_pending at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->vcpu_info[0].evtchn_upcall_pending)) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++            printk("evtchn_upcall_mask at %lu\n", (uint64_t)(&(((struct shared_info *)mfn_to_virt(nat->gpfn))->vcpu_info[0].evtchn_upcall_mask)) - (uint64_t)(mfn_to_virt(nat->gpfn)));
++        }
++
++        UNLOCK_BIGLOCK(d);
++        rcu_unlock_domain(d);
++
++        return ret;
++    }
++    default:
++        printk("%s %d: nested compat memory op not implemented!\n", __FILE__, __LINE__);       
++        return -EINVAL;
++    }
++}
++
++int compat_nested_grant_table_op(unsigned int cmd,
++                          XEN_GUEST_HANDLE(void) cmp_uop,
++                          unsigned int count){
++    return do_nested_grant_table_op(cmd, cmp_uop, count);
++}
++
++
++/* simple passthrough */
++DO(nested_memory_op)(int cmd, XEN_GUEST_HANDLE(void) arg){
++    switch ( cmd ){
++
++        /* can map straight through */
++    case XENMEM_add_to_physmap:{
++        int ret = 0;
++        struct xen_add_to_physmap xatp;
++        struct xen_add_to_physmap xatp_n;
++        struct domain *d;
++
++        if ( copy_from_guest(&xatp, arg, 1) )
++            return -EFAULT;
++
++        if ( xatp.domid == DOMID_SELF )
++            d = rcu_lock_current_domain();
++        else if ( !IS_PRIV(current->domain) ){
++            printk("%s %d\n", __FILE__, __LINE__);
++            return -EPERM;
++        }
++        else if ( (d = rcu_lock_domain_by_id(xatp.domid)) == NULL ){
++            printk("%s %d\n", __FILE__, __LINE__);
++            return -ESRCH;
++        }
++
++        switch ( xatp.space ){
++        case XENMAPSPACE_shared_info:
++        case XENMAPSPACE_grant_table:
++            xatp_n.domid = DOMID_SELF;
++            xatp_n.idx = xatp.idx;
++            xatp_n.space = xatp.space;
++            xatp_n.gpfn = xatp.gpfn;  /* gpfn is the mfn */
++
++            ret = HYPERVISOR_nested_memory_op(XENMEM_add_to_physmap, &xatp_n);
++            if ( ret ){
++                printk("memory op failed with %d\n", ret);
++                rcu_unlock_domain(d);
++                return -EINVAL;
++            }
++            break;
++        default:
++            printk("unknown xatp.space (not shared_info or grant_table)\n");
++            rcu_unlock_domain(d);
++            return -EINVAL;
++            break;
++        }
++        rcu_unlock_domain(d);
++        return 0;
++    }
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        return -EINVAL;
++    }
++}
++
++/* simple passthrough */
++DO(nested_xen_version)(int cmd, XEN_GUEST_HANDLE(void) arg){
++    switch ( cmd ){
++    case XENVER_version:
++        return HYPERVISOR_nested_xen_version(XENVER_version, 0);
++    case XENVER_get_features:{
++        xen_feature_info_t fi;
++
++        if ( copy_from_guest(&fi, arg, 1) )
++            return -EFAULT;
++        
++        if ( HYPERVISOR_nested_xen_version(XENVER_get_features, &fi) )
++            return -EFAULT;
++
++        if ( copy_to_guest(arg, &fi, 1) )
++            return -EFAULT;
++
++        return 0;
++    }
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        return -EINVAL;
++    }
++}
++
++/* simple passthrough */
++DO(nested_hvm_op)(int op, XEN_GUEST_HANDLE(void) arg){
++    switch (op) {
++    case HVMOP_set_param:
++    case HVMOP_get_param:{
++        struct xen_hvm_param a;
++
++        if (copy_from_guest(&a, arg, 1))
++            return -EFAULT;
++
++        HYPERVISOR_nested_hvm_op(op, &a);
++
++        if (op == HVMOP_get_param) {
++            if (copy_to_guest(arg, &a, 1))
++                return -EFAULT;
++        }
++        
++        return 0;
++    }
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        return -EINVAL;
++    }
++}
++
++/* simple passthrough */
++DO(nested_grant_table_op)(unsigned int cmd, 
++                          XEN_GUEST_HANDLE(void) uop, 
++                          unsigned int count){
++    long rc = -EINVAL;
++    struct domain *d = current->domain;
++    struct gnttab_query_size op;
++
++    if ( count > 512 )
++        return -EINVAL;
++    
++    LOCK_BIGLOCK(d);
++    
++    switch ( cmd ) {
++    case GNTTABOP_query_size:
++        if ( count != 1 ){
++            rc = -EINVAL;
++            goto out;
++        }
++
++        if (copy_from_guest(&op, uop, 1)){
++            rc = -EFAULT;
++            goto out;
++        }
++
++        rc = HYPERVISOR_nested_grant_table_op(cmd, &op, count);
++
++        if (copy_to_guest(uop, &op, 1)){
++            rc = -EFAULT;
++            goto out;
++        }
++
++        break;
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        break;
++    }
++
++  out:
++    UNLOCK_BIGLOCK(d);
++    
++    return rc;
++}
++
++/* simple passthrough */
++DO(nested_event_channel_op)(int cmd, 
++                            XEN_GUEST_HANDLE(void) arg){
++    long rc;
++
++    switch ( cmd ) {
++    case EVTCHNOP_unmask: {
++        struct evtchn_unmask unmask;
++        if ( copy_from_guest(&unmask, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &unmask);
++        break;
++    }
++    case EVTCHNOP_close: {
++        struct evtchn_close close;
++        if ( copy_from_guest(&close, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &close);
++        break;
++    }
++    case EVTCHNOP_send: {
++        struct evtchn_send send;
++        if ( copy_from_guest(&send, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &send);
++        break;
++    }
++    case EVTCHNOP_alloc_unbound: {
++        struct evtchn_alloc_unbound alloc_unbound;
++        if ( copy_from_guest(&alloc_unbound, arg, 1) != 0 )
++            return -EFAULT;
++        rc = HYPERVISOR_nested_event_channel_op(cmd, &alloc_unbound);
++        if ( (rc == 0) && (copy_to_guest(arg, &alloc_unbound, 1) != 0) )
++            rc = -EFAULT; /* Cleaning up here would be a mess! */
++        break;
++    }
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        rc = -ENOSYS;
++        break;
++    }
++
++    return rc;
++}
++
++/* simple passthrough */
++DO(nested_sched_op)(int cmd, 
++                    XEN_GUEST_HANDLE(void) arg){
++    long ret = 0;
++
++    switch ( cmd ){
++    case SCHEDOP_shutdown:{
++        struct sched_shutdown sched_shutdown;
++
++        ret = -EFAULT;
++        if ( copy_from_guest(&sched_shutdown, arg, 1) )
++            break;
++
++        ret = HYPERVISOR_nested_sched_op(cmd, &sched_shutdown);        
++
++        break;
++    }
++
++    default:
++        printk("%s %d: nested hypercall not implemented!\n", __FILE__, __LINE__);
++        ret = -ENOSYS;
++        break;
++    }
++
++    return ret;
++}
++
++
++DO(nested_init_hvm)(void){
++    return get_hypercall_stubs();
++}
++
++
++
++
++
++/*
++ * Local variables:
++ * mode: C
++ * c-set-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -Naur old/kernel-2.6.18/xen/include/xen/hypercall.h new/kernel-2.6.18/xen/include/xen/hypercall.h
+--- old/kernel-2.6.18/xen/include/xen/hypercall.h	2011-05-17 12:58:00.000000000 -0400
++++ new/kernel-2.6.18/xen/include/xen/hypercall.h	2011-05-17 13:21:36.000000000 -0400
+@@ -16,6 +16,8 @@
+ #include <public/event_channel.h>
+ #include <asm/hypercall.h>
+ 
++#include <xen/nested_hypercall.h>
++
+ extern long
+ do_ni_hypercall(
+     void);
+diff -Naur old/kernel-2.6.18/xen/include/xen/nested_hypercall.h new/kernel-2.6.18/xen/include/xen/nested_hypercall.h
+--- old/kernel-2.6.18/xen/include/xen/nested_hypercall.h	1969-12-31 19:00:00.000000000 -0500
++++ new/kernel-2.6.18/xen/include/xen/nested_hypercall.h	2011-05-17 13:34:17.000000000 -0400
+@@ -0,0 +1,119 @@
++#ifndef __NESTED_HYPERCALL_H__
++#define __NESTED_HYPERCALL_H__
++
++/* Make sure this doesn't go over 47 */
++#define __HYPERVISOR_nested_init_hvm          38
++#define __HYPERVISOR_nested_xen_version       39
++#define __HYPERVISOR_nested_memory_op         40
++#define __HYPERVISOR_nested_hvm_op            41
++#define __HYPERVISOR_nested_grant_table_op    42
++#define __HYPERVISOR_nested_event_channel_op  43
++#define __HYPERVISOR_nested_sched_op          44
++
++#define HYPERCALL_STR_nested(name)                         \
++    "movabs hypercall_stubs,%%rax; "                       \
++    "add $("STR(__HYPERVISOR_##name)" * 32),%%rax; "       \
++    "call *%%rax"
++
++#define _hypercall2_nested(type, name, a1, a2)                       \
++    ({                                                               \
++        long __res, __ign1, __ign2;                                  \
++        asm volatile (                                               \
++                      HYPERCALL_STR_nested(name)                     \
++                      : "=a" (__res), "=D" (__ign1), "=S" (__ign2)   \
++                      : "1" ((long)(a1)), "2" ((long)(a2))           \
++                      : "memory" );                                  \
++        (type)__res;                                                 \
++    })
++
++#define _hypercall3_nested(type, name, a1, a2, a3)                      \
++    ({                                                                  \
++        long __res, __ign1, __ign2, __ign3;                             \
++        asm volatile (                                                  \
++                      HYPERCALL_STR_nested(name)                        \
++                      : "=a" (__res), "=D" (__ign1), "=S" (__ign2),     \
++                        "=d" (__ign3)                                   \
++                      : "1" ((long)(a1)), "2" ((long)(a2)),             \
++                        "3" ((long)(a3))                                \
++                      : "memory" );                                     \
++        (type)__res;                                                    \
++    })
++
++
++static inline int 
++HYPERVISOR_nested_xen_version(int cmd, void *arg){
++    return _hypercall2_nested(int, xen_version, cmd, arg);
++}
++static inline int 
++HYPERVISOR_nested_memory_op(int cmd, void *arg){
++    return _hypercall2_nested(int, memory_op, cmd, arg);
++}
++static inline unsigned long
++HYPERVISOR_nested_hvm_op(int op, void *arg){
++    return _hypercall2_nested(unsigned long, hvm_op, op, arg);
++}
++static inline int
++HYPERVISOR_nested_grant_table_op(unsigned int cmd, void *uop, unsigned int count){
++    return _hypercall3_nested(int, grant_table_op, cmd, uop, count);
++}
++static inline int
++HYPERVISOR_nested_event_channel_op(unsigned int cmd, void *arg){
++    return _hypercall2_nested(int, event_channel_op, cmd, arg);
++}
++static inline int
++HYPERVISOR_nested_sched_op(unsigned int cmd, void *arg){
++    return _hypercall2_nested(int, sched_op, cmd, arg);
++}
++
++
++extern long
++do_nested_init_hvm(
++    void);
++
++extern long
++do_nested_xen_version(
++    int cmd,
++    XEN_GUEST_HANDLE(void) arg);
++
++extern long 
++compat_nested_memory_op(
++                        int op, 
++                        XEN_GUEST_HANDLE(void) arg);
++extern long
++do_nested_memory_op(
++                    int op,
++    XEN_GUEST_HANDLE(void) arg);
++
++
++extern long
++do_nested_hvm_op(
++                 int op,
++          XEN_GUEST_HANDLE(void) arg);
++
++extern long
++do_nested_grant_table_op(
++                  unsigned int cmd,
++                  XEN_GUEST_HANDLE(void) uop,
++                  unsigned int count);
++
++extern long
++do_nested_event_channel_op(
++                          int cmd, 
++                          XEN_GUEST_HANDLE(void) arg);
++
++extern long
++do_nested_sched_op(
++                   int cmd, 
++                   XEN_GUEST_HANDLE(void) arg);
++
++#endif
++
++/*
++ * Local variables:
++ * mode: C
++ * c-set-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -Naur old/kernel-2.6.18/xen/Makefile new/kernel-2.6.18/xen/Makefile
+--- old/kernel-2.6.18/xen/Makefile	2011-05-17 12:58:04.000000000 -0400
++++ new/kernel-2.6.18/xen/Makefile	2011-05-17 13:34:37.000000000 -0400
+@@ -2,7 +2,7 @@
+ # All other places this is stored (eg. compile.h) should be autogenerated.
+ export XEN_VERSION       = 3
+ export XEN_SUBVERSION    = 1
+-export XEN_EXTRAVERSION ?= .2$(XEN_VENDORVERSION)
++export XEN_EXTRAVERSION ?= .2-blanket$(XEN_VENDORVERSION)
+ export XEN_FULLVERSION   = $(XEN_VERSION).$(XEN_SUBVERSION)$(XEN_EXTRAVERSION)
+ -include xen-version
+ 

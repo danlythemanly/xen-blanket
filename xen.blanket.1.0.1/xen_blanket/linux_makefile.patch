@@ -1,0 +1,11 @@
+--- patch/kernel-2.6.18/linux-2.6.18.x86_64/Makefile	2011-05-17 13:02:50.000000000 -0400
++++ new/kernel-2.6.18/linux-2.6.18.x86_64/Makefile	2011-05-18 11:23:42.000000000 -0400
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 18
+-EXTRAVERSION = -prep
++EXTRAVERSION = -194.26.1.el5xen.blanket
+ RHEL_MAJOR = 5
+ RHEL_MINOR = 5
+ NAME=Avast! A bilge rat!

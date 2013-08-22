@@ -1,0 +1,68 @@
+diff -Naur patch/kernel-2.6.18/blanket_drivers/kvm/Makefile new/kernel-2.6.18/blanket_drivers/kvm/Makefile
+--- patch/kernel-2.6.18/blanket_drivers/kvm/Makefile	1969-12-31 19:00:00.000000000 -0500
++++ new/kernel-2.6.18/blanket_drivers/kvm/Makefile	2011-05-18 10:05:02.000000000 -0400
+@@ -0,0 +1,6 @@
++obj-m += virtio.o
++obj-m += virtio_ring.o
++obj-m += virtio_pci.o
++obj-m += virtio_balloon.o
++obj-m += virtio_net.o
++obj-m += virtio_blk.o
+\ No newline at end of file
+diff -Naur patch/kernel-2.6.18/blanket_drivers/kvm/virtio_balloon.c new/kernel-2.6.18/blanket_drivers/kvm/virtio_balloon.c
+--- patch/kernel-2.6.18/blanket_drivers/kvm/virtio_balloon.c	2011-05-18 10:09:50.000000000 -0400
++++ new/kernel-2.6.18/blanket_drivers/kvm/virtio_balloon.c	2011-05-18 10:13:17.000000000 -0400
+@@ -60,7 +60,7 @@
+ 
+ static u32 page_to_balloon_pfn(struct page *page)
+ {
+-	unsigned long pfn = page_to_pfn(page);
++	unsigned long pfn = pfn_to_mfn(page_to_pfn(page));
+ 
+ 	BUILD_BUG_ON(PAGE_SHIFT < VIRTIO_BALLOON_PFN_SHIFT);
+ 	/* Convert pfn from Linux page size to balloon page size. */
+@@ -129,7 +129,7 @@
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < num; i++) {
+-		__free_page(pfn_to_page(pfns[i]));
++		__free_page(pfn_to_page(mfn_to_pfn(pfns[i])));
+ 		totalram_pages++;
+ 	}
+ }
+diff -Naur patch/kernel-2.6.18/blanket_drivers/kvm/virtio_pci.c new/kernel-2.6.18/blanket_drivers/kvm/virtio_pci.c
+--- patch/kernel-2.6.18/blanket_drivers/kvm/virtio_pci.c	2011-05-18 10:09:50.000000000 -0400
++++ new/kernel-2.6.18/blanket_drivers/kvm/virtio_pci.c	2011-05-18 10:16:16.000000000 -0400
+@@ -241,7 +241,7 @@
+ 	}
+ 
+ 	/* activate the queue */
+-	iowrite32(virt_to_phys(info->queue) >> PAGE_SHIFT,
++	iowrite32(virt_to_mfn(info->queue),
+ 		  vp_dev->ioaddr + VIRTIO_PCI_QUEUE_PFN);
+ 
+ 	/* create the vring */
+diff -Naur patch/kernel-2.6.18/blanket_drivers/kvm/virtio_ring.c new/kernel-2.6.18/blanket_drivers/kvm/virtio_ring.c
+--- patch/kernel-2.6.18/blanket_drivers/kvm/virtio_ring.c	2011-05-18 10:09:50.000000000 -0400
++++ new/kernel-2.6.18/blanket_drivers/kvm/virtio_ring.c	2011-05-18 10:51:30.000000000 -0400
+@@ -104,14 +104,18 @@
+ 	head = vq->free_head;
+ 	for (i = vq->free_head; out; i = vq->vring.desc[i].next, out--) {
+ 		vq->vring.desc[i].flags = VRING_DESC_F_NEXT;
+-		vq->vring.desc[i].addr = page_to_phys(sg->page) + sg->offset;
++		vq->vring.desc[i].addr = 
++		  (pfn_to_mfn(page_to_pfn(sg->page)) << PAGE_SHIFT) 
++		  + sg->offset;
+ 		vq->vring.desc[i].len = sg->length;
+ 		prev = i;
+ 		sg++;
+ 	}
+ 	for (; in; i = vq->vring.desc[i].next, in--) {
+ 		vq->vring.desc[i].flags = VRING_DESC_F_NEXT|VRING_DESC_F_WRITE;
+-		vq->vring.desc[i].addr = page_to_phys(sg->page) + sg->offset;
++		vq->vring.desc[i].addr = 
++		  (pfn_to_mfn(page_to_pfn(sg->page)) << PAGE_SHIFT)
++		  + sg->offset;
+ 		vq->vring.desc[i].len = sg->length;
+ 		prev = i;
+ 		sg++;

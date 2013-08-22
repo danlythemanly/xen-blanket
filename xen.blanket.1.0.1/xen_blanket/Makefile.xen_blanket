@@ -1,0 +1,82 @@
+# There are 3 things to build:
+# - a custom blanket Xen that has support for blanket drivers.
+# - a standard paravirtualized Linux kernel (for the second-layer
+#   Domain 0).  You don't have to use the one provided, but it is 
+#   known to work with the blanket drivers and blanket Xen.
+# - blanket drivers.  You should choose either Xen or KVM depending on
+#   what the underlying hypervisor is.
+
+
+# By default, build all of the blanket drivers against the kernel in
+# this directory that they are known to work with (be sure to build
+# the kernel first).
+
+KERNEL_SRC=${PWD}/linux-2.6.18.x86_64
+KERNEL_VERSION=2.6.18-194.26.1.el5xen.blanket
+
+# If you have a different paravirtualized Linux kernel installed, you
+# can try to build the blanket drivers for it.
+
+#KERNEL_SRC=/usr/src/kernels/2.6.18-194.32.1.el5xen-x86_64/
+#KERNEL_VERSION=2.6.18-194.32.1.el5xen
+
+all: linux xen blanket_drivers_xen blanket_drivers_kvm
+install: linux_install xen_install blanket_drivers_xen_install 
+
+
+xen: 
+	make -C xen/
+
+xen_install: xen
+	make -C xen/ install
+
+xen_clean:
+	make -C xen/ distclean
+
+
+linux:
+	cp linux-2.6.18.x86_64/configs/kernel-2.6.18-x86_64-xen.config linux-2.6.18.x86_64/.config
+	(cd linux-2.6.18.x86_64; make oldconfig && make prepare && make && make modules)
+
+linux_install: linux
+	(cd linux-2.6.18.x86_64; make install && make modules_install)
+
+linux_clean:
+	(cd linux-2.6.18.x86_64; make distclean)
+
+
+
+blanket_drivers_xen:
+	make -C ${KERNEL_SRC} M=${PWD}/blanket_drivers/xen/ modules
+
+blanket_drivers_xen_install: blanket_drivers_xen
+	mkdir -p /lib/modules/${KERNEL_VERSION}/extra/
+	cp blanket_drivers/xen/xen-vbd.ko blanket_drivers/xen/xen-platform-pci.ko blanket_drivers/xen/xen-vnif.ko /lib/modules/${KERNEL_VERSION}/extra/
+	depmod -a -v ${KERNEL_VERSION}
+	mkinitrd --preload xen-vbd --with xen-platform-pci --with xen-vnif -f /boot/initrd-${KERNEL_VERSION}.img ${KERNEL_VERSION}
+
+blanket_drivers_xen_clean:
+	(cd blanket_drivers/xen/; rm -rf *.o *.ko .*.cmd Module.* *.mod.c .tmp_versions *~)
+
+
+
+blanket_drivers_kvm:
+	make -C ${KERNEL_SRC} M=${PWD}/blanket_drivers/kvm/ modules
+
+blanket_drivers_kvm_install: blanket_drivers_kvm
+	cp blanket_drivers/kvm/virtio.ko blanket_drivers/kvm/virtio_ring.ko blanket_drivers/kvm/virtio_pci.ko blanket_drivers/kvm/virtio_balloon.ko /lib/modules/${KERNEL_VERSION}/kernel/drivers/virtio/
+	cp blanket_drivers/kvm/virtio_blk.ko /lib/modules/${KERNEL_VERSION}/kernel/drivers/block/
+	cp blanket_drivers/kvm/virtio_net.ko /lib/modules/${KERNEL_VERSION}/kernel/drivers/net/
+	depmod -a -v ${KERNEL_VERSION}
+	mkinitrd --with virtio_pci --with virtio_blk -f /boot/initrd-${KERNEL_VERSION}.img ${KERNEL_VERSION}
+
+blanket_drivers_kvm_clean:
+	(cd blanket_drivers/kvm/; rm -rf *.o *.ko .*.cmd Module.* *.mod.c .tmp_versions *~)
+
+
+
+
+clean: blanket_drivers_xen_clean blanket_drivers_kvm_clean xen_clean linux_clean
+
+
+

@@ -1,0 +1,21 @@
+This version of Xenblanket is tested on CentOS5.6 and Fedora14. Follow the instructions to install
+on your own system
+
+0. Install necessary packages in order to build Xen and Dom0 Linux Kernel.
+
+For Fedora, the followings are recommended:
+
+yum groupinstall "Development Libraries"
+yum groupinstall "Development Tools"
+
+yum install transfig wget texi2html libaio-devel dev86 glibc-devel e2fsprogs-devel gitk mkinitrd iasl xz-devel bzip2-devel pciutils-libs pciutils-devel SDL-devel libX11-devel gtk2-devel bridge-utils PyXML qemu-common qemu-img mercurial
+
+yum install glibc-devel.i686
+
+For more details, see http://wiki.xensource.com/xenwiki/Fedora13Xen4Tutorial
+
+1. Run "make" to build both Xen and Dom0 for Xenblanket. Alternatively, you can run "make Xen" or "make Linux" to build Xen and Dom0 separately.
+
+2. Run "make Install" to install the Xen and Dom0 Kernel under /boot directory
+
+3. Change the grub, add XENBLANKET and XENBLANKET-DEBUG(for debugging means), as an example, see the sample grub.conf given in this folder. "tdt=0" is necessary in order for emulated APIC timer to tick normally.
